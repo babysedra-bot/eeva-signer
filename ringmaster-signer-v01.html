@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>EEVA Ringmaster Signer</title>
+<style>
+:root{--ink:#14161a;--muted:#5d6470;--line:#d9dde3;--bg:#f6f7f9;--card:#fff;--ok:#1f7a4a;--warn:#a15c00;--bad:#b42318;--accent:#2a4bd7}
+*{box-sizing:border-box}body{margin:0;font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg)}
+main{max-width:640px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:22px;margin:4px 0 2px}p.sub{color:var(--muted);margin:0 0 18px}
+section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:0 0 14px}
+h2{font-size:17px;margin:0 0 8px}label{display:block;font-size:14px;color:var(--muted);margin:10px 0 4px}
+input,textarea{width:100%;font:15px ui-monospace,SFMono-Regular,Menlo,monospace;padding:10px;border:1px solid var(--line);border-radius:10px;background:#fbfbfc}
+textarea{min-height:96px}button{font:600 16px -apple-system,sans-serif;border:0;border-radius:10px;padding:12px 16px;margin:10px 8px 0 0;background:var(--accent);color:#fff}
+button.secondary{background:#e8ebf0;color:var(--ink)}button.danger{background:var(--bad)}button:disabled{opacity:.45}
+.fp{font:13px ui-monospace,Menlo,monospace;word-break:break-all;background:#f0f2f5;padding:8px;border-radius:8px}
+.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--line);padding:8px 0}.row span:first-child{color:var(--muted)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}pre{white-space:pre-wrap;word-break:break-word;background:#f0f2f5;padding:10px;border-radius:8px;max-height:260px;overflow:auto;font-size:13px}
+.hidden{display:none}.note{font-size:14px;color:var(--muted)}
+</style></head><body><main>
+<h1>EEVA Ringmaster Signer</h1>
+<p class="sub">Your key lives only on this device. EEVA can write to the sandbox only when you approve here.</p>
+
+<section id="keyCard"><h2>Your key</h2><div id="keyStatus" class="note">Checking…</div>
+ <button id="createKey" class="hidden">Create my key</button></section>
+
+<section id="enrolCard" class="hidden"><h2>Connect to EEVA (once)</h2>
+ <p class="note">EEVA sends an 8-letter code to your ntfy alerts. Type it here.</p>
+ <label for="code">Enrolment code</label><input id="code" autocapitalize="characters" maxlength="8" placeholder="ABCD2345">
+ <button id="enrol">Send my public key</button></section>
+
+<section id="reviewCard"><h2>Approve a sandbox write</h2>
+ <button id="fetchReq" class="secondary">Get latest request</button>
+ <label for="reqText">…or paste the request here</label><textarea id="reqText" placeholder='{"t":"eeva-grant-request",…}'></textarea>
+ <button id="review" class="secondary">Review</button>
+ <div id="reviewOut" class="hidden"></div></section>
+
+<section id="sendCard" class="hidden"><h2>Send to EEVA</h2><div id="sendStatus" class="note"></div>
+ <pre id="outMsg"></pre><button id="copyOut" class="secondary">Copy</button>
+ <p class="note">If sending failed, copy this and paste it as a message at <a id="ntfyLink" href="#" rel="noopener">ntfy.sh</a>.</p></section>
+
+<section><h2>Settings</h2>
+ <label for="reqTopic">Request topic (EEVA → you)</label><input id="reqTopic">
+ <label for="gntTopic">Reply topic (you → EEVA)</label><input id="gntTopic">
+ <button id="saveSettings" class="secondary">Save</button><span id="saved" class="note"></span></section>
+</main>
+<script type="module">
+/**
+ * Ringmaster phone signer core v0.1 — the exact logic the iPad signer page runs (inlined into
+ * ringmaster-signer-v01.html at build time) so it can be tested in Node with the same WebCrypto API.
+ * The private key is generated non-extractable and never leaves the device. Only the public JWK,
+ * an enrolment proof and per-request signatures are ever sent.
+ */
+const enc=new TextEncoder();
+const hex=buf=>[...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join("");
+const b64=buf=>{let s="";for(const b of new Uint8Array(buf))s+=String.fromCharCode(b);return btoa(s);};
+async function sha256Hex(subtle,text){return hex(await subtle.digest("SHA-256",enc.encode(text)));}
+async function createSignerKey(subtle){
+ return subtle.generateKey({name:"ECDSA",namedCurve:"P-256"},false,["sign","verify"]);
+}
+async function publicJwkOf(subtle,keyPair){
+ const j=await subtle.exportKey("jwk",keyPair.publicKey);return {kty:j.kty,crv:j.crv,x:j.x,y:j.y};
+}
+// Must equal the PC's keySha256: sha256 of JSON.stringify({crv,kty,x,y}) in that key order.
+async function fingerprint(subtle,jwk){return sha256Hex(subtle,JSON.stringify({crv:jwk.crv,kty:jwk.kty,x:jwk.x,y:jwk.y}));}
+async function sign(subtle,keyPair,text){
+ return b64(await subtle.sign({name:"ECDSA",hash:"SHA-256"},keyPair.privateKey,enc.encode(text)));
+}
+async function buildEnrollMessage(subtle,keyPair,code){
+ if(!/^[A-Z2-9]{8}$/.test(String(code||"")))throw Error("ENROLL_CODE_FORMAT");
+ const publicJwk=await publicJwkOf(subtle,keyPair);
+ return JSON.stringify({t:"eeva-enroll",publicJwk,code,signature:await sign(subtle,keyPair,"eeva-enroll:"+code)});
+}
+// What the Ringmaster sees before deciding. Throws on anything malformed; never signs by itself.
+async function reviewRequestMessage(subtle,messageText,{myKeySha256,now=Date.now()}={}){
+ let m;try{m=JSON.parse(String(messageText).trim())}catch{throw Error("NOT_A_REQUEST")}
+ if(!m||m.t!=="eeva-grant-request"||typeof m.requestText!=="string")throw Error("NOT_A_REQUEST");
+ let r;try{r=JSON.parse(m.requestText)}catch{throw Error("NOT_A_REQUEST")}
+ if(r.schema!=="eeva.ringmaster-sandbox-write-request.v0.1"||r.operation!=="WRITE_FILE")throw Error("UNSUPPORTED_REQUEST");
+ const review={requestId:r.requestId,relPath:r.relPath,purpose:r.purpose,contentBytes:r.contentBytes,
+  creates:r.beforeSha256===null,expiresAt:r.expiresAt,expired:now>Date.parse(r.expiresAt),
+  forMyKey:myKeySha256?r.keySha256===myKeySha256:null,releaseAllowed:r.releaseAllowed,productionAllowed:r.productionAllowed,
+  content:null,contentVerified:false};
+ if(typeof m.content==="string"){
+  review.contentVerified=(await sha256Hex(subtle,m.content))===r.contentSha256;
+  if(review.contentVerified)review.content=m.content;
+ }
+ review.signable=!review.expired&&review.forMyKey!==false&&r.releaseAllowed===false&&r.productionAllowed===false;
+ return {review,requestText:m.requestText};
+}
+async function buildGrantMessage(subtle,keyPair,requestText){
+ return JSON.stringify({t:"eeva-grant",requestText,signature:await sign(subtle,keyPair,requestText)});
+}
+
+const subtle=crypto.subtle,$=id=>document.getElementById(id);
+const TOPIC=/^[A-Za-z0-9_-]{24,64}$/;let kp=null,myFp=null,pending=null;
+const store={get(k){try{return localStorage.getItem(k)||""}catch{return ""}},set(k,v){try{localStorage.setItem(k,v)}catch{}}};
+function idb(){return new Promise((res,rej)=>{let r;try{r=indexedDB.open("eeva-signer",1)}catch(e){return rej(e)}
+ r.onupgradeneeded=()=>r.result.createObjectStore("keys");r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});}
+async function loadKey(){try{const db=await idb();return await new Promise(res=>{const q=db.transaction("keys").objectStore("keys").get("kp");q.onsuccess=()=>res(q.result||null);q.onerror=()=>res(null)})}catch{return null}}
+async function saveKey(k){const db=await idb();await new Promise((res,rej)=>{const t=db.transaction("keys","readwrite");t.objectStore("keys").put(k,"kp");t.oncomplete=res;t.onerror=()=>rej(t.error)});}
+async function showKey(){
+ if(!subtle){$("keyStatus").innerHTML='<span class="bad">This page is not in a secure context, so it cannot make keys.</span>';return}
+ kp=await loadKey();
+ if(!kp){$("keyStatus").textContent="No key on this device yet.";$("createKey").classList.remove("hidden");$("enrolCard").classList.add("hidden");return}
+ myFp=await fingerprint(subtle,await publicJwkOf(subtle,kp));
+ $("keyStatus").innerHTML='Key ready. Fingerprint (must match EEVA\'s):<div class="fp">'+myFp+'</div>';
+ $("createKey").classList.add("hidden");$("enrolCard").classList.remove("hidden");
+}
+async function send(text){
+ $("sendCard").classList.remove("hidden");$("outMsg").textContent=text;
+ const topic=store.get("gntTopic");$("ntfyLink").href=TOPIC.test(topic)?"https://ntfy.sh/"+topic:"https://ntfy.sh/";
+ $("ntfyLink").textContent=TOPIC.test(topic)?"ntfy.sh/"+topic:"ntfy.sh";
+ if(!TOPIC.test(topic)){$("sendStatus").innerHTML='<span class="warn">Set the reply topic in Settings, or copy and paste below.</span>';return}
+ try{const r=await fetch("https://ntfy.sh/"+topic,{method:"POST",body:text});
+  $("sendStatus").innerHTML=r.ok?'<span class="ok">Sent to EEVA.</span>':'<span class="warn">Not sent (HTTP '+r.status+'). Copy and paste below.</span>';}
+ catch{$("sendStatus").innerHTML='<span class="warn">This page cannot reach ntfy here. Copy and paste below.</span>';}
+}
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const row=(k,v,cls="")=>'<div class="row"><span>'+k+'</span><span class="'+cls+'">'+v+'</span></div>';
+$("createKey").onclick=async()=>{try{const k=await createSignerKey(subtle);await saveKey(k);await showKey();}
+ catch(e){$("keyStatus").innerHTML='<span class="bad">Could not keep a key in this browser ('+esc(e.message||e)+').</span>'}};
+$("enrol").onclick=async()=>{try{await send(await buildEnrollMessage(subtle,kp,$("code").value.trim().toUpperCase()))}catch(e){$("sendStatus").textContent=String(e.message||e)}};
+$("fetchReq").onclick=async()=>{const topic=store.get("reqTopic");if(!TOPIC.test(topic)){$("reqText").value="";$("reqText").placeholder="Set the request topic in Settings first.";return}
+ try{const r=await fetch("https://ntfy.sh/"+topic+"/json?poll=1&since=12h");const lines=(await r.text()).trim().split("\n").reverse();
+  for(const l of lines){try{const e=JSON.parse(l);if(e.event==="message"&&e.message.includes('"eeva-grant-request"')){$("reqText").value=e.message;return}}catch{}}
+  $("reqText").value="";$("reqText").placeholder="No request in the last 12 hours.";}
+ catch{$("reqText").placeholder="This page cannot reach ntfy here. Long-press the notification, copy, and paste."}};
+$("review").onclick=async()=>{const out=$("reviewOut");out.classList.remove("hidden");
+ try{const {review:r,requestText}=await reviewRequestMessage(subtle,$("reqText").value,{myKeySha256:myFp});pending=requestText;
+  out.innerHTML=row("Write to",esc(r.relPath))+row("Why",esc(r.purpose))+row("Size",r.contentBytes+" bytes")+row("New file?",r.creates?"yes":"no, replaces")+
+   row("Expires",esc(r.expiresAt),r.expired?"bad":"")+row("For my key",r.forMyKey?"yes":"NO",r.forMyKey?"ok":"bad")+
+   (r.content!==null?'<label>Exact content (verified against the signed hash)</label><pre>'+esc(r.content)+'</pre>':
+    '<p class="warn">Content not shown'+(r.contentVerified===false&&r.content===null?" or did not match its hash":"")+'. Only the hash is pinned.</p>')+
+   (r.signable?'<button id="approve">Approve this write</button><button id="decline" class="danger">Decline</button>':'<p class="bad">This request cannot be approved.</p>');
+  if(r.signable){$("approve").onclick=async()=>{await send(await buildGrantMessage(subtle,kp,pending));pending=null;out.classList.add("hidden")};
+   $("decline").onclick=()=>{pending=null;out.innerHTML='<p class="note">Declined. Nothing was signed.</p>'};}
+ }catch(e){out.innerHTML='<p class="bad">'+esc(e.message||e)+'</p>'}};
+$("copyOut").onclick=async()=>{try{await navigator.clipboard.writeText($("outMsg").textContent);$("copyOut").textContent="Copied"}catch{$("copyOut").textContent="Select and copy manually"}};
+$("reqTopic").value=store.get("reqTopic");$("gntTopic").value=store.get("gntTopic");
+$("saveSettings").onclick=()=>{store.set("reqTopic",$("reqTopic").value.trim());store.set("gntTopic",$("gntTopic").value.trim());$("saved").textContent=" Saved."};
+showKey();
+</script></body></html>
